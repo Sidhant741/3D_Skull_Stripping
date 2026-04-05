@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.egg-info/
+
+.venv/
+venv/
+.env
+
+# Data and outputs
+data/
+datasets/
+dataset/
+*.tar
+*.nii
+*.nii.gz
+*.nrrd
+
+# Training artifacts
+checkpoints/
+results/
+runs/
+output*
+*.pth
+*.ckpt
+
+# OS files
+.DS_Store
+
+# # Optional: keep local config out of git
+# config.py
+# config_test.py
