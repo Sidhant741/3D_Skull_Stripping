@@ -1,80 +1,154 @@
-import nibabel as nib
+import argparse
+import os
 import numpy as np
 import torch
-import torch.nn.functional as F
-from nibabel.processing import resample_to_output
-from unet3d import UNet3D  
-import os
+import nibabel as nib
 import SimpleITK as sitk
+from unet3d import UNet3DDeep
 
-def resample_to_spacing(image, new_spacing=(1.0, 1.0, 1.0)):
-    original_spacing = image.GetSpacing()
-    original_size = image.GetSize()
-    
-    new_size = [
-        int(round(osz * ospc / nspc)) 
-        for osz, ospc, nspc in zip(original_size, original_spacing, new_spacing)
-    ]
-    
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetOutputSpacing(new_spacing)
-    resampler.SetSize(new_size)
-    resampler.SetOutputDirection(image.GetDirection())
-    resampler.SetOutputOrigin(image.GetOrigin())
-    resampler.SetInterpolator(sitk.sitkLinear)
-    
-    return resampler.Execute(image)
 
-def n4_bias_correction(image_path):
+def n4_bias_correction(image_path: str):
     image = sitk.ReadImage(image_path, sitk.sitkFloat32)
-
-    # Resample to (1,1,1) spacing
-    image = resample_to_spacing(image, (1.0, 1.0, 1.0))
-    
-    mask = sitk.OtsuThreshold(image, 0, 1, 200)
+    mask  = sitk.OtsuThreshold(image, 0, 1, 200)
     corrector = sitk.N4BiasFieldCorrectionImageFilter()
-    corrected_image = corrector.Execute(image, mask)
-    return corrected_image
-
-# Paths
-input_path = "/storage/shagun/medical/dataset/test/images/CC0003_philips_15_63_F.nii.gz"
-checkpoint_path = "./checkpoints/epoch003_valLoss0.703928.pth"
-output_path = "output"
+    return corrector.Execute(image, mask)
 
 
-#img_nib = nib.load(input_path)
-#img_resampled = resample_to_output(img_nib, voxel_sizes=(1, 1, 1))
-#img_data = img_resampled.get_fdata()
-#original_shape = img_data.shape
-
-img_data = n4_bias_correction(input_path)
-img_np = sitk.GetArrayFromImage(img_data)
-
-
-#img_norm = (img_data - np.min(img_data)) / (np.max(img_data) - np.min(img_data))
-img_tensor = torch.tensor(img_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-#img_tensor = img_tensor.permute(0, 1, 4, 2, 3)  # [B, C, D, H, W]
-
-# Step 3: Load model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = UNet3D(in_channels=1, num_classes=1, level_channels=[32, 64, 128], bottleneck_channel=256).to(device)
-model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-model.eval()
+def load_model(ckpt_path: str, device: torch.device):
+    model = UNet3DDeep(
+        in_channels=1, num_classes=1,
+        level_channels=[32, 64, 128, 256],
+        bottleneck_channel=512,
+    ).to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+    return model
 
 
-with torch.no_grad():
-    input_tensor = img_tensor.to(device)
-    output = model(input_tensor)
-    output = torch.sigmoid(output)
-    output = (output > 0.5).float()
-    output_np = output.squeeze().cpu().numpy()
+def _normalize_nonzero(vol: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    mask = vol != 0
+    if not mask.any():
+        return vol
+    mean = vol[mask].mean()
+    std  = vol[mask].std()
+    return (vol - mean) / (std + eps)
 
-output_np = np.clip(output_np, 0, 1)  
 
-output_sitk = sitk.GetImageFromArray(output_np.astype(np.uint8))  # or np.float32 if needed
-output_sitk.CopyInformation(img_data)  # optional: preserve spacing, origin, direction
-sitk.WriteImage(output_sitk, output_path + ".nii.gz")
-#output_nifti = nib.Nifti1Image(output_np, affine=img_resampled.affine)
-#nib.save(output_nifti, output_path)
+def _save_like(base_img: nib.Nifti1Image, data: np.ndarray, path: str, dtype=np.float32):
+    """
+    Save data in the same world space as base_img.
 
-print(f" Prediction saved to: {output_path}")
+    We do NOT copy the original header — that carries stale dim/pixdim fields
+    that describe the original voxel layout and would conflict with the affine,
+    causing viewers to misplace the mask. Let nibabel build a clean header from
+    the data shape + affine, then only transplant the qform/sform codes.
+    """
+    img = nib.Nifti1Image(data.astype(dtype), base_img.affine)
+    qform, qcode = base_img.get_qform(coded=True)
+    sform, scode = base_img.get_sform(coded=True)
+    if qform is not None:
+        img.set_qform(qform, int(qcode))
+    if sform is not None:
+        img.set_sform(sform, int(scode))
+    nib.save(img, path)
+
+
+def run_inference(
+    input_path: str,
+    checkpoint_path: str,
+    output_path: str | None,
+    threshold: float = 0.5,
+    use_bias_correction: bool = False,
+    save_mask: bool = True,
+    stripped_output: str | None = None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    model = load_model(checkpoint_path, device)
+
+    # ------------------------------------------------------------------ #
+    # Load — nibabel gives (x, y, z) = (R-L, A-P, S-I)                  #
+    # ------------------------------------------------------------------ #
+    img_nib  = nib.load(input_path)
+    orig_xyz = img_nib.get_fdata().astype(np.float32)   # (x, y, z)
+
+    if use_bias_correction:
+        # SimpleITK: GetArrayFromImage → (z, y, x); transpose to (x, y, z)
+        img_sitk = n4_bias_correction(input_path)
+        sitk_arr = sitk.GetArrayFromImage(img_sitk)         # (z, y, x)
+        orig_xyz = np.transpose(sitk_arr, (2, 1, 0))        # (x, y, z)
+
+    # ------------------------------------------------------------------ #
+    # Pre-process — mirrors dataset.py exactly                            #
+    #   dataset.py:  np.moveaxis(image, 1, 0)  →  (x,y,z) → (y,x,z)    #
+    #                                               A-P axis becomes D    #
+    # ------------------------------------------------------------------ #
+    img_np = np.moveaxis(orig_xyz, 1, 0)    # (x,y,z) → (y,x,z)
+    img_np = _normalize_nonzero(img_np)
+
+    # Build tensor (1, 1, D, H, W)
+    img_tensor = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0).float()
+
+    # ------------------------------------------------------------------ #
+    # Inference                                                           #
+    # ------------------------------------------------------------------ #
+    with torch.no_grad():
+        output    = model(img_tensor.to(device))     # eval → single tensor
+        output    = torch.sigmoid(output)
+        output    = (output > threshold).float()
+        output_np = output.squeeze().cpu().numpy()   # (y, x, z)
+
+    output_np = np.clip(output_np, 0, 1)
+
+    # Invert: (y,x,z) → (x,y,z)  — move axis 0 back to position 1
+    mask_xyz = np.moveaxis(output_np, 0, 1)
+
+    # Sanity check
+    assert mask_xyz.shape == orig_xyz.shape, (
+        f"Shape mismatch after axis inversion: "
+        f"mask {mask_xyz.shape} vs image {orig_xyz.shape}"
+    )
+
+    # ------------------------------------------------------------------ #
+    # Save                                                                #
+    # ------------------------------------------------------------------ #
+    if save_mask and output_path:
+        _save_like(img_nib, mask_xyz, output_path, dtype=np.uint8)
+        print(f"Mask saved → {output_path}")
+
+    if stripped_output:
+        stripped = orig_xyz * mask_xyz              # both (x, y, z)
+        _save_like(img_nib, stripped, stripped_output, dtype=np.float32)
+        print(f"Stripped volume saved → {stripped_output}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="3D skull stripping inference")
+    p.add_argument("--input",              required=True,
+                   help="Input NIfTI path (.nii or .nii.gz)")
+    p.add_argument("--checkpoint",         required=True,
+                   help="Model checkpoint path (.pth)")
+    p.add_argument("--output",
+                   help="Output mask path (.nii.gz)")
+    p.add_argument("--stripped_output",
+                   help="Skull-stripped volume output path (.nii.gz)")
+    p.add_argument("--no_bias_correction", action="store_true",
+                   help="Skip N4 bias field correction")
+    p.add_argument("--no_mask",            action="store_true",
+                   help="Do not save the binary mask")
+    p.add_argument("--threshold",          type=float, default=0.5,
+                   help="Sigmoid threshold for binarisation (default: 0.5)")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_inference(
+        input_path=args.input,
+        checkpoint_path=args.checkpoint,
+        output_path=args.output,
+        threshold=args.threshold,
+        use_bias_correction=not args.no_bias_correction,
+        save_mask=not args.no_mask,
+        stripped_output=args.stripped_output,
+    )

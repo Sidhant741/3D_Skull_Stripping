@@ -9,7 +9,7 @@ Dataset configurations:
 
 """""
 DATASET_PATH = "dataset"
-TASK_ID = 9
+TASK_ID = 3
 IN_CHANNELS = 1
 NUM_CLASSES = 1
 BACKGROUND_AS_CLASS = False
@@ -26,7 +26,7 @@ Training configurations:
     :param BCE_WEIGHTS -> the class weights for the Binary Cross Entropy loss
 """""
 TRAIN_VAL_TEST_SPLIT = [0.8, 0.1, 0.1]
-SPLIT_SEED = 42
+SPLIT_SEED = 67
 TRAINING_EPOCH = 100
 TRAIN_BATCH_SIZE = 1
 VAL_BATCH_SIZE = 1

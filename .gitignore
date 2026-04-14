@@ -20,7 +20,7 @@ dataset/
 *.nrrd
 
 # Training artifacts
-checkpoints/
+# checkpoints/
 results/
 runs/
 output*
