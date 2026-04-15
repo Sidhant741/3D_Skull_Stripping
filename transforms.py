@@ -12,18 +12,6 @@ from monai.transforms import (
 # Shared augmentation pipeline (without the final ToTensord)
 _TRAIN_AUGS = [
     NormalizeIntensityd(keys='image', nonzero=True, channel_wise=True),
-    RandFlipd(keys=['image', 'label'], prob=0.5, spatial_axis=0),
-    RandFlipd(keys=['image', 'label'], prob=0.5, spatial_axis=1),
-    RandFlipd(keys=['image', 'label'], prob=0.5, spatial_axis=2),
-    RandAffined(
-        keys=['image', 'label'],
-        prob=0.5,
-        rotate_range=(0.1, 0.1, 0.1),
-        scale_range=(0.1, 0.1, 0.1),
-        mode=('bilinear', 'nearest'),
-        padding_mode='zeros',
-    ),
-    RandGaussianNoised(keys='image', prob=0.2, mean=0.0, std=0.1),
     RandScaleIntensityd(keys='image', factors=0.1, prob=1.0),
     RandShiftIntensityd(keys='image', offsets=0.1, prob=1.0),
 ]

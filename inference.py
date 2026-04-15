@@ -6,6 +6,24 @@ import nibabel as nib
 import SimpleITK as sitk
 from unet3d import UNet3DDeep
 
+import scipy.ndimage as ndi
+
+def post_process_mask(mask_xyz, min_hole_size=500, closing_radius=1):
+    """
+    Fill holes and remove small spurious objects.
+    mask_xyz: binary array in (x, y, z) orientation (same as nibabel output).
+    """
+    # Binary closing to bridge thin gaps
+    struct = ndi.generate_binary_structure(3, 2)
+    closed = ndi.binary_closing(mask_xyz, structure=struct, iterations=closing_radius)
+    # Fill internal holes
+    filled = ndi.binary_fill_holes(closed)
+    # Remove small objects (likely false positives)
+    labeled, num_features = ndi.label(filled)
+    sizes = ndi.sum(filled, labeled, range(1, num_features + 1))
+    mask_clean = np.isin(labeled, np.where(sizes >= min_hole_size)[0] + 1)
+    return mask_clean.astype(np.uint8)
+
 
 def n4_bias_correction(image_path: str):
     image = sitk.ReadImage(image_path, sitk.sitkFloat32)
@@ -102,6 +120,8 @@ def run_inference(
 
     # Invert: (y,x,z) → (x,y,z)  — move axis 0 back to position 1
     mask_xyz = np.moveaxis(output_np, 0, 1)
+
+    mask_xyz = post_process_mask(mask_xyz, min_hole_size=500, closing_radius=1)
 
     # Sanity check
     assert mask_xyz.shape == orig_xyz.shape, (

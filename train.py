@@ -94,6 +94,29 @@ class BCEDiceLoss(torch.nn.Module):
         return self.bce_weight * bce_loss + (1.0 - self.bce_weight) * dice_loss
 
 
+class FocalTverskyLoss(torch.nn.Module):
+    """
+    Focal Tversky loss – better for thin structures like corpus callosum.
+    alpha: weight for false positives (default 0.7)
+    beta : weight for false negatives (default 0.3) → higher beta penalises missing tissue more
+    gamma: focal exponent for hard examples (default 0.75)
+    """
+    def __init__(self, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-6):
+        super().__init__()
+        self.alpha = alpha
+        self.beta  = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, inputs, targets):
+        inputs = torch.sigmoid(inputs)
+        dims = tuple(range(1, inputs.ndim))
+        tp = (inputs * targets).sum(dim=dims)
+        fp = (inputs * (1 - targets)).sum(dim=dims)
+        fn = ((1 - inputs) * targets).sum(dim=dims)
+        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        return torch.pow(1 - tversky, self.gamma).mean()
+
 # ------------------------------------------------------------------ #
 # Metrics                                                             #
 # ------------------------------------------------------------------ #
@@ -165,7 +188,7 @@ def main():
         batch_size=TRAIN_BATCH_SIZE,
         sampler=train_sampler,
         shuffle=(train_sampler is None),   # only shuffle when no sampler
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
     )
@@ -198,7 +221,8 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # ---- Optimizer / scheduler / scaler --------------------------- #
-    criterion = BCEDiceLoss(bce_weight=0.1)
+    # criterion = BCEDiceLoss(bce_weight=0.1)
+    criterion = FocalTverskyLoss(alpha=0.7, beta=0.5, gamma=0.75)
     optimizer = Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
     # ReduceLROnPlateau needs the globally-averaged val loss, which we
     # all-reduce below — so it's safe to call on every rank.
